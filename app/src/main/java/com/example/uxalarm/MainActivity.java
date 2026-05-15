@@ -7,7 +7,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
-import android.graphics.ColorFilter;
+import android.graphics.Paint;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffColorFilter;
 import android.graphics.Typeface;
@@ -22,6 +22,7 @@ import android.text.TextWatcher;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.Window;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
@@ -31,14 +32,22 @@ import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.NumberPicker;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
 
+import androidx.camera.core.ExperimentalGetImage;
+import androidx.camera.core.ImageAnalysis;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.content.res.AppCompatResources;
 import androidx.appcompat.widget.SwitchCompat;
-import androidx.core.content.ContextCompat;
+
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.label.ImageLabel;
+import com.google.mlkit.vision.label.ImageLabeler;
+import com.google.mlkit.vision.label.ImageLabeling;
+import com.google.mlkit.vision.label.defaults.ImageLabelerOptions;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -47,23 +56,37 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.lang.reflect.Field;
 
 public class MainActivity extends AppCompatActivity {
     private static final int BLACK = Color.BLACK;
     private static final int WHITE = Color.WHITE;
     private static final String PREFS_NAME = "uxalarm_prefs";
     private static final String PREFS_KEY_ALARMS = "alarms_json";
+    private static final ScanTarget[] SCAN_TARGETS = {
+            new ScanTarget("bottle_water", "💧", "Bottle of water", new String[]{"tableware", "bottle", "water bottle", "plastic bottle"}),
+            new ScanTarget("shoe", "👟", "Shoe", new String[]{"shoe", "footwear", "sneaker"}),
+            new ScanTarget("book", "📚", "Book", new String[]{"book", "books"}),
+            new ScanTarget("glasses", "👓", "Glasses", new String[]{"goggles", "glasses", "sunglasses", "eyewear"}),
+            new ScanTarget("paper", "📄", "Paper", new String[]{"paper", "document", "paper product", "stationery"})
+    };
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final List<Alarm> alarms = new ArrayList<>();
+    private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
 
     private AlarmType activeTab = AlarmType.ALARM;
     private String activeMenuId = null;
     private Alarm editingAlarm = null;
     private Alarm triggeredAlarm = null;
+    private androidx.camera.lifecycle.ProcessCameraProvider activeCameraProvider = null;
 
     private enum AlarmType {
         ALARM,
@@ -82,6 +105,7 @@ public class MainActivity extends AppCompatActivity {
         String bedtimeText = "";
         String goodMorningText = "";
         String reminderText = "";
+        String scanTargetKey = "bottle_water";
 
         Alarm(String id, int hour, int minute, AlarmType type, boolean enabled) {
             this.id = id;
@@ -99,12 +123,35 @@ public class MainActivity extends AppCompatActivity {
             copy.bedtimeText = bedtimeText;
             copy.goodMorningText = goodMorningText;
             copy.reminderText = reminderText;
+            copy.scanTargetKey = scanTargetKey;
             return copy;
+        }
+    }
+
+    private static class ScanTarget {
+        String key;
+        String emoji;
+        String name;
+        String[] labels;
+
+        ScanTarget(String key, String emoji, String name, String[] labels) {
+            this.key = key;
+            this.emoji = emoji;
+            this.name = name;
+            this.labels = labels;
+        }
+
+        String displayName() {
+            return emoji + " " + name;
         }
     }
 
     private interface StringSetter {
         void set(String value);
+    }
+
+    private interface IntSetter {
+        void set(int value);
     }
 
     @Override
@@ -133,6 +180,7 @@ public class MainActivity extends AppCompatActivity {
             requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 200);
         }
 
+        rescheduleAllAlarms();
         handleAlarmIntent(getIntent());
     }
 
@@ -154,8 +202,19 @@ public class MainActivity extends AppCompatActivity {
         }
         String alarmId = intent.getStringExtra(AlarmReceiver.EXTRA_ALARM_ID);
         if (alarmId != null) {
+            if (alarmId.endsWith("_bedtime")) {
+                String baseAlarmId = alarmId.substring(0, alarmId.length() - "_bedtime".length());
+                for (Alarm alarm : alarms) {
+                    if (alarm.id.equals(baseAlarmId)) {
+                        showAlarmList();
+                        handler.post(() -> showSleepReminder(alarm));
+                        return;
+                    }
+                }
+            }
             for (Alarm alarm : alarms) {
                 if (alarm.id.equals(alarmId)) {
+                    handleTriggeredAlarmState(alarm);
                     showSuccess(alarm);
                     return;
                 }
@@ -167,6 +226,8 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        stopCameraPreview();
+        cameraExecutor.shutdown();
         super.onDestroy();
     }
 
@@ -182,6 +243,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void showAlarmList() {
         handler.removeCallbacksAndMessages(null);
+        stopCameraPreview();
         getWindow().setStatusBarColor(WHITE);
         getWindow().setNavigationBarColor(WHITE);
         triggeredAlarm = null;
@@ -197,15 +259,18 @@ public class MainActivity extends AppCompatActivity {
         scrollView.addView(list);
         root.addView(scrollView, new LinearLayout.LayoutParams(match(), 0, 1));
 
-        boolean hasItems = false;
+        List<Alarm> visibleAlarms = new ArrayList<>();
         for (Alarm alarm : alarms) {
             if (alarm.type == activeTab) {
-                hasItems = true;
-                addAlarmCard(list, alarm);
+                visibleAlarms.add(alarm);
             }
         }
+        Collections.sort(visibleAlarms, Comparator.comparingInt(this::minutesSinceMidnight));
+        for (Alarm alarm : visibleAlarms) {
+            addAlarmCard(list, alarm);
+        }
 
-        if (!hasItems) {
+        if (visibleAlarms.isEmpty()) {
             LinearLayout empty = new LinearLayout(this);
             empty.setOrientation(LinearLayout.VERTICAL);
             empty.setGravity(Gravity.CENTER);
@@ -381,6 +446,7 @@ public class MainActivity extends AppCompatActivity {
         addTimeRow(form);
         addSoundRow(form);
         if (editingAlarm.type == AlarmType.ALARM) {
+            addScanTargetSection(form);
             addRepeatSection(form);
             addBedtimeSection(form);
             addTextField(form, "GOOD MORNING TEXT", "e.g., Good Morning!", editingAlarm.goodMorningText, value -> editingAlarm.goodMorningText = value, false);
@@ -410,7 +476,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void addSoundRow(LinearLayout form) {
         LinearLayout row = formRow("SOUND");
-        Spinner spinner = spinner(new String[]{"Default", "Chime", "Bell", "Radar"});
+        Spinner spinner = spinner(new String[]{"System Alarm", "System Notification", "System Ringtone", "Beep"});
         setSpinnerSelection(spinner, editingAlarm.sound);
         spinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
@@ -423,6 +489,25 @@ public class MainActivity extends AppCompatActivity {
             }
         });
         row.addView(spinner, new LinearLayout.LayoutParams(dp(170), dp(52)));
+        form.addView(row);
+        addDivider(form);
+    }
+
+    private void addScanTargetSection(LinearLayout form) {
+        LinearLayout row = formRow("SCAN TO STOP");
+        Spinner spinner = spinner(scanTargetDisplayNames());
+        setSpinnerSelection(spinner, scanTargetByKey(editingAlarm.scanTargetKey).displayName());
+        spinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                editingAlarm.scanTargetKey = SCAN_TARGETS[position].key;
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+        row.addView(spinner, new LinearLayout.LayoutParams(dp(210), dp(52)));
         form.addView(row);
         addDivider(form);
     }
@@ -582,23 +667,13 @@ public class MainActivity extends AppCompatActivity {
         timeRow.setGravity(Gravity.CENTER);
         panel.addView(timeRow);
 
-        android.widget.NumberPicker hourPicker = new android.widget.NumberPicker(this);
-        hourPicker.setMinValue(0);
-        hourPicker.setMaxValue(23);
-        hourPicker.setValue(hour[0]);
-        hourPicker.setOnValueChangedListener((p, oldVal, newVal) -> hour[0] = newVal);
-        timeRow.addView(hourPicker, new LinearLayout.LayoutParams(wrap(), wrap()));
+        timeRow.addView(numberPicker(numberLabels(24, true), hour[0], value -> hour[0] = value), new LinearLayout.LayoutParams(dp(96), dp(270)));
 
         TextView colon = label(":", 72, BLACK, Typeface.NORMAL);
-        colon.setPadding(dp(12), 0, dp(12), 0);
-        timeRow.addView(colon);
+        colon.setGravity(Gravity.CENTER);
+        timeRow.addView(colon, new LinearLayout.LayoutParams(wrap(), dp(270)));
 
-        android.widget.NumberPicker minutePicker = new android.widget.NumberPicker(this);
-        minutePicker.setMinValue(0);
-        minutePicker.setMaxValue(59);
-        minutePicker.setValue(minute[0]);
-        minutePicker.setOnValueChangedListener((p, oldVal, newVal) -> minute[0] = newVal);
-        timeRow.addView(minutePicker, new LinearLayout.LayoutParams(wrap(), wrap()));
+        timeRow.addView(numberPicker(numberLabels(60, true), minute[0], value -> minute[0] = value), new LinearLayout.LayoutParams(dp(96), dp(270)));
 
         LinearLayout actions = new LinearLayout(this);
         actions.setPadding(0, dp(44), 0, 0);
@@ -670,18 +745,24 @@ public class MainActivity extends AppCompatActivity {
 
         if (alarm.type == AlarmType.ALARM) {
             Button snooze = filledButton("Snooze (10m)", WHITE, BLACK);
-            snooze.setOnClickListener(v -> showAlarmList());
+            snooze.setOnClickListener(v -> {
+                stopCurrentAlert(alarm.id);
+                showAlarmList();
+            });
             actions.addView(snooze, new LinearLayout.LayoutParams(match(), dp(62)));
         } else {
             Button remindLater = filledButton("Remind Me Later", WHITE, BLACK);
-            remindLater.setOnClickListener(v -> showRemindLaterPicker(alarm));
+            remindLater.setOnClickListener(v -> {
+                stopCurrentAlert(alarm.id);
+                showRemindLaterPicker(alarm);
+            });
             actions.addView(remindLater, new LinearLayout.LayoutParams(match(), dp(62)));
         }
 
         Button stop = filledButton(alarm.type == AlarmType.REMINDER ? "Mark as Done" : "Scan Water to Stop", BLACK, WHITE);
         stop.setOnClickListener(v -> {
             if (alarm.type == AlarmType.REMINDER) {
-                showAlarmList();
+                markReminderDone(alarm.id);
             } else {
                 showScanScreen();
             }
@@ -719,23 +800,13 @@ public class MainActivity extends AppCompatActivity {
         timeRow.setGravity(Gravity.CENTER);
         panel.addView(timeRow);
 
-        android.widget.NumberPicker hourPicker = new android.widget.NumberPicker(this);
-        hourPicker.setMinValue(0);
-        hourPicker.setMaxValue(23);
-        hourPicker.setValue(addHours[0]);
-        hourPicker.setOnValueChangedListener((p, oldVal, newVal) -> addHours[0] = newVal);
-        timeRow.addView(hourPicker, new LinearLayout.LayoutParams(wrap(), wrap()));
+        timeRow.addView(numberPicker(numberLabels(24, false), addHours[0], value -> addHours[0] = value), new LinearLayout.LayoutParams(dp(96), dp(270)));
 
         TextView colon = label("h : m", 24, BLACK, Typeface.NORMAL);
-        colon.setPadding(dp(12), 0, dp(12), 0);
-        timeRow.addView(colon);
+        colon.setGravity(Gravity.CENTER);
+        timeRow.addView(colon, new LinearLayout.LayoutParams(wrap(), dp(270)));
 
-        android.widget.NumberPicker minutePicker = new android.widget.NumberPicker(this);
-        minutePicker.setMinValue(0);
-        minutePicker.setMaxValue(59);
-        minutePicker.setValue(addMinutes[0]);
-        minutePicker.setOnValueChangedListener((p, oldVal, newVal) -> addMinutes[0] = newVal);
-        timeRow.addView(minutePicker, new LinearLayout.LayoutParams(wrap(), wrap()));
+        timeRow.addView(numberPicker(numberLabels(60, true), addMinutes[0], value -> addMinutes[0] = value), new LinearLayout.LayoutParams(dp(96), dp(270)));
 
         LinearLayout actions = new LinearLayout(this);
         actions.setPadding(0, dp(44), 0, 0);
@@ -765,10 +836,15 @@ public class MainActivity extends AppCompatActivity {
         setContentView(wrapWithBackground(root, false));
     }
 
+    @ExperimentalGetImage
     private void showScanScreen() {
         handler.removeCallbacksAndMessages(null);
+        stopCameraPreview();
         getWindow().setStatusBarColor(WHITE);
         getWindow().setNavigationBarColor(WHITE);
+        ScanTarget target = scanTargetByKey(triggeredAlarm != null ? triggeredAlarm.scanTargetKey : "bottle_water");
+        ImageLabeler labeler = ImageLabeling.getClient(ImageLabelerOptions.DEFAULT_OPTIONS);
+        final boolean[] itemFound = {false};
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -776,11 +852,11 @@ public class MainActivity extends AppCompatActivity {
         root.setPadding(dp(24), dp(54), dp(24), dp(34));
         root.setBackgroundColor(Color.TRANSPARENT);
 
-        TextView title = label("Scan Water", 30, BLACK, Typeface.NORMAL);
+        TextView title = label("Scan " + target.displayName(), 30, BLACK, Typeface.NORMAL);
         title.setGravity(Gravity.CENTER);
         root.addView(title);
 
-        TextView subtitle = label("Point camera at water to wake up", 17, BLACK, Typeface.NORMAL);
+        TextView subtitle = label("Show the selected item to unlock Stop Alarm", 17, BLACK, Typeface.NORMAL);
         subtitle.setGravity(Gravity.CENTER);
         subtitle.setPadding(0, dp(8), 0, 0);
         root.addView(subtitle);
@@ -790,9 +866,12 @@ public class MainActivity extends AppCompatActivity {
 
         FrameLayout frame = new FrameLayout(this);
         frame.setBackground(rounded(WHITE, dp(48), BLACK, 2));
+        TextView frameText = label("LOOKING FOR " + target.name.toUpperCase(Locale.US), 18, BLACK, Typeface.BOLD);
+        frameText.setGravity(Gravity.CENTER);
 
         if (androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{android.Manifest.permission.CAMERA}, 100);
+            frameText.setText("CAMERA PERMISSION NEEDED");
         } else {
             androidx.camera.view.PreviewView previewView = new androidx.camera.view.PreviewView(this);
             frame.addView(previewView, new FrameLayout.LayoutParams(match(), match()));
@@ -800,28 +879,71 @@ public class MainActivity extends AppCompatActivity {
             cameraProviderFuture.addListener(() -> {
                 try {
                     androidx.camera.lifecycle.ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
+                    activeCameraProvider = cameraProvider;
                     androidx.camera.core.Preview preview = new androidx.camera.core.Preview.Builder().build();
                     preview.setSurfaceProvider(previewView.getSurfaceProvider());
+
+                    ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .build();
+                    final boolean[] isProcessing = {false};
+                    imageAnalysis.setAnalyzer(cameraExecutor, imageProxy -> {
+                        if (itemFound[0] || isProcessing[0]) {
+                            imageProxy.close();
+                            return;
+                        }
+                        android.media.Image mediaImage = imageProxy.getImage();
+                        if (mediaImage == null) {
+                            imageProxy.close();
+                            return;
+                        }
+                        isProcessing[0] = true;
+                        InputImage image = InputImage.fromMediaImage(mediaImage, imageProxy.getImageInfo().getRotationDegrees());
+                        labeler.process(image)
+                                .addOnSuccessListener(labels -> {
+                                    for (ImageLabel imageLabel : labels) {
+                                        if (matchesScanTarget(target, imageLabel)) {
+                                            itemFound[0] = true;
+                                            runOnUiThread(() -> {
+                                                frameText.setText(target.name.toUpperCase(Locale.US) + " FOUND");
+                                                frame.setBackground(rounded(WHITE, dp(48), BLACK, 3));
+                                            });
+                                            break;
+                                        }
+                                    }
+                                    if (!itemFound[0] && !labels.isEmpty()) {
+                                        ImageLabel best = labels.get(0);
+                                        runOnUiThread(() -> frameText.setText("SAW " + best.getText().toUpperCase(Locale.US)));
+                                    }
+                                })
+                                .addOnFailureListener(e -> runOnUiThread(() -> frameText.setText("KEEP SCANNING")))
+                                .addOnCompleteListener(task -> {
+                                    isProcessing[0] = false;
+                                    imageProxy.close();
+                                });
+                    });
+
                     cameraProvider.unbindAll();
-                    cameraProvider.bindToLifecycle(this, androidx.camera.core.CameraSelector.DEFAULT_BACK_CAMERA, preview);
+                    cameraProvider.bindToLifecycle(this, androidx.camera.core.CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis);
                 } catch (Exception e) {}
             }, androidx.core.content.ContextCompat.getMainExecutor(this));
         }
 
-        TextView frameText = label("WATER", 20, BLACK, Typeface.BOLD);
-        frameText.setGravity(Gravity.CENTER);
         frame.addView(frameText, new FrameLayout.LayoutParams(match(), match()));
         root.addView(frame, new LinearLayout.LayoutParams(dp(288), dp(288)));
 
         View spacerBottom = new View(this);
         root.addView(spacerBottom, new LinearLayout.LayoutParams(1, 0, 1));
 
-        Button scan = filledButton("Tap to Scan", BLACK, WHITE);
-        root.addView(scan, new LinearLayout.LayoutParams(match(), dp(64)));
+        Button stop = filledButton("Looking for " + target.displayName(), BLACK, WHITE);
+        stop.setEnabled(false);
+        root.addView(stop, new LinearLayout.LayoutParams(match(), dp(64)));
 
         Button cancel = flatButton("Cancel");
         cancel.setTextColor(BLACK);
         cancel.setOnClickListener(v -> {
+            labeler.close();
+            stopCameraPreview();
             if (triggeredAlarm != null) {
                 showSuccess(triggeredAlarm);
             } else {
@@ -830,16 +952,25 @@ public class MainActivity extends AppCompatActivity {
         });
         root.addView(cancel, new LinearLayout.LayoutParams(match(), dp(54)));
 
-        scan.setOnClickListener(v -> {
-            scan.setEnabled(false);
-            scan.setText("Analyzing...");
-            frameText.setText("SCANNING");
-            handler.postDelayed(() -> {
-                scan.setText("Water Verified!");
-                frameText.setText("VERIFIED");
-                frame.setBackground(rounded(WHITE, dp(48), BLACK, 3));
-                handler.postDelayed(this::showAlarmList, 1200);
-            }, 1800);
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (itemFound[0]) {
+                    stop.setText(target.displayName() + " found - Stop Alarm");
+                    stop.setEnabled(true);
+                    return;
+                }
+                handler.postDelayed(this, 250);
+            }
+        }, 250);
+
+        stop.setOnClickListener(v -> {
+            labeler.close();
+            stopCameraPreview();
+            if (triggeredAlarm != null) {
+                stopCurrentAlert(triggeredAlarm.id);
+            }
+            showAlarmList();
         });
 
         setContentView(wrapWithBackground(root, false));
@@ -847,12 +978,61 @@ public class MainActivity extends AppCompatActivity {
 
     private void showSleepReminder(Alarm alarm) {
         activeMenuId = null;
-        String message = firstNonEmpty(alarm.bedtimeText, "You need to get to sleep.");
+        String message = "You should be asleep now so you can sleep "
+                + alarm.bedtimeReminderHours
+                + " hours before your alarm.";
+        String customText = firstNonEmpty(alarm.bedtimeText);
+        if (!customText.isEmpty()) {
+            message += "\n\n" + customText;
+        }
         new AlertDialog.Builder(this)
                 .setTitle("Time to Rest")
                 .setMessage(message)
-                .setPositiveButton("OK", (dialog, which) -> dialog.dismiss())
+                .setPositiveButton("OK", (dialog, which) -> {
+                    stopCurrentAlert(alarm.id + "_bedtime");
+                    dialog.dismiss();
+                })
                 .show();
+    }
+
+    private void markReminderDone(String id) {
+        stopCurrentAlert(id);
+        for (int i = alarms.size() - 1; i >= 0; i--) {
+            if (alarms.get(i).id.equals(id)) {
+                cancelAlarm(alarms.get(i));
+                alarms.remove(i);
+            }
+        }
+        activeMenuId = null;
+        triggeredAlarm = null;
+        activeTab = AlarmType.REMINDER;
+        saveAlarms();
+        showAlarmList();
+    }
+
+    private void handleTriggeredAlarmState(Alarm alarm) {
+        if (alarm.type != AlarmType.ALARM) {
+            return;
+        }
+
+        if (alarm.repeat.isEmpty()) {
+            alarm.enabled = false;
+            cancelAlarm(alarm);
+        } else {
+            scheduleAlarm(alarm);
+        }
+        saveAlarms();
+    }
+
+    private void stopCurrentAlert(String id) {
+        AlarmReceiver.stopActiveAlert(this, id);
+    }
+
+    private void stopCameraPreview() {
+        if (activeCameraProvider != null) {
+            activeCameraProvider.unbindAll();
+            activeCameraProvider = null;
+        }
     }
 
     private void deleteAlarm(String id) {
@@ -869,11 +1049,90 @@ public class MainActivity extends AppCompatActivity {
 
     private Spinner spinner(String[] items) {
         Spinner spinner = new Spinner(this);
-        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, items);
+        ArrayAdapter<String> adapter = new ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, items) {
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                View view = super.getView(position, convertView, parent);
+                styleSpinnerText(view);
+                return view;
+            }
+
+            @Override
+            public View getDropDownView(int position, View convertView, ViewGroup parent) {
+                View view = super.getDropDownView(position, convertView, parent);
+                styleSpinnerText(view);
+                return view;
+            }
+        };
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinner.setAdapter(adapter);
         spinner.setBackground(rounded(WHITE, dp(18), BLACK, 2));
+        spinner.setPopupBackgroundDrawable(rounded(WHITE, dp(12), BLACK, 1));
         spinner.setPadding(dp(12), 0, dp(12), 0);
         return spinner;
+    }
+
+    private void styleSpinnerText(View view) {
+        view.setBackgroundColor(WHITE);
+        if (view instanceof TextView) {
+            TextView textView = (TextView) view;
+            textView.setTextColor(BLACK);
+            textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+            textView.setPadding(dp(12), dp(10), dp(12), dp(10));
+        }
+    }
+
+    private NumberPicker numberPicker(String[] labels, int selectedValue, IntSetter setter) {
+        NumberPicker picker = new NumberPicker(this);
+        picker.setMinValue(0);
+        picker.setMaxValue(labels.length - 1);
+        picker.setDisplayedValues(labels);
+        picker.setValue(Math.max(0, Math.min(selectedValue, labels.length - 1)));
+        picker.setWrapSelectorWheel(true);
+        picker.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
+        picker.setBackground(rounded(WHITE, dp(18), BLACK, 2));
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            picker.setTextColor(BLACK);
+        }
+        applyNumberPickerTextColor(picker);
+        picker.post(() -> applyNumberPickerTextColor(picker));
+        picker.setOnValueChangedListener((view, oldVal, newVal) -> {
+            setter.set(newVal);
+            applyNumberPickerTextColor(view);
+            view.post(() -> applyNumberPickerTextColor(view));
+        });
+        return picker;
+    }
+
+    private void applyNumberPickerTextColor(NumberPicker picker) {
+        for (int i = 0; i < picker.getChildCount(); i++) {
+            View child = picker.getChildAt(i);
+            if (child instanceof TextView) {
+                TextView textView = (TextView) child;
+                textView.setTextColor(BLACK);
+                textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
+                textView.setGravity(Gravity.CENTER);
+                textView.setBackgroundColor(WHITE);
+            }
+        }
+        try {
+            Field selectorWheelPaintField = NumberPicker.class.getDeclaredField("mSelectorWheelPaint");
+            selectorWheelPaintField.setAccessible(true);
+            Paint paint = (Paint) selectorWheelPaintField.get(picker);
+            if (paint != null) {
+                paint.setColor(BLACK);
+                paint.setTextSize(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 30, getResources().getDisplayMetrics()));
+            }
+            picker.invalidate();
+        } catch (Exception ignored) {}
+    }
+
+    private String[] numberLabels(int count, boolean twoDigit) {
+        String[] labels = new String[count];
+        for (int i = 0; i < count; i++) {
+            labels[i] = twoDigit ? twoDigits(i) : String.valueOf(i);
+        }
+        return labels;
     }
 
     private void setSpinnerSelection(Spinner spinner, String value) {
@@ -972,8 +1231,42 @@ public class MainActivity extends AppCompatActivity {
         return "";
     }
 
+    private ScanTarget scanTargetByKey(String key) {
+        for (ScanTarget target : SCAN_TARGETS) {
+            if (target.key.equals(key)) {
+                return target;
+            }
+        }
+        return SCAN_TARGETS[0];
+    }
+
+    private String[] scanTargetDisplayNames() {
+        String[] names = new String[SCAN_TARGETS.length];
+        for (int i = 0; i < SCAN_TARGETS.length; i++) {
+            names[i] = SCAN_TARGETS[i].displayName();
+        }
+        return names;
+    }
+
+    private boolean matchesScanTarget(ScanTarget target, ImageLabel label) {
+        if (label.getConfidence() < 0.55f) {
+            return false;
+        }
+        String normalized = label.getText().toLowerCase(Locale.US);
+        for (String acceptedLabel : target.labels) {
+            if (normalized.contains(acceptedLabel.toLowerCase(Locale.US))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private String formatTime(int hour, int minute) {
         return twoDigits(hour) + ":" + twoDigits(minute);
+    }
+
+    private int minutesSinceMidnight(Alarm alarm) {
+        return alarm.hour * 60 + alarm.minute;
     }
 
     private String twoDigits(int value) {
@@ -1014,6 +1307,7 @@ public class MainActivity extends AppCompatActivity {
                 obj.put("bedtimeText", a.bedtimeText);
                 obj.put("goodMorningText", a.goodMorningText);
                 obj.put("reminderText", a.reminderText);
+                obj.put("scanTargetKey", a.scanTargetKey);
                 arr.put(obj);
             }
             getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -1046,6 +1340,7 @@ public class MainActivity extends AppCompatActivity {
                 a.bedtimeText = obj.optString("bedtimeText", "");
                 a.goodMorningText = obj.optString("goodMorningText", "");
                 a.reminderText = obj.optString("reminderText", "");
+                a.scanTargetKey = obj.optString("scanTargetKey", "bottle_water");
                 alarms.add(a);
             }
         } catch (Exception ignored) {}
@@ -1054,6 +1349,8 @@ public class MainActivity extends AppCompatActivity {
     // ── Scheduling ──
 
     private void scheduleAlarm(Alarm alarm) {
+        cancelAlarm(alarm);
+
         AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
         Intent intent = new Intent(this, AlarmReceiver.class);
         intent.putExtra(AlarmReceiver.EXTRA_ALARM_ID, alarm.id);
@@ -1064,14 +1361,7 @@ public class MainActivity extends AppCompatActivity {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
         );
 
-        Calendar cal = Calendar.getInstance();
-        cal.set(Calendar.HOUR_OF_DAY, alarm.hour);
-        cal.set(Calendar.MINUTE, alarm.minute);
-        cal.set(Calendar.SECOND, 0);
-        cal.set(Calendar.MILLISECOND, 0);
-        if (cal.getTimeInMillis() <= System.currentTimeMillis()) {
-            cal.add(Calendar.DAY_OF_YEAR, 1);
-        }
+        Calendar cal = nextTriggerTime(alarm);
 
         try {
             am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.getTimeInMillis(), pi);
@@ -1082,6 +1372,58 @@ public class MainActivity extends AppCompatActivity {
         // Schedule bedtime reminder if applicable
         if (alarm.type == AlarmType.ALARM && alarm.bedtimeReminderHours > 0) {
             scheduleBedtimeReminder(alarm, cal.getTimeInMillis());
+        }
+    }
+
+    private Calendar nextTriggerTime(Alarm alarm) {
+        Calendar now = Calendar.getInstance();
+        Calendar candidate = Calendar.getInstance();
+        candidate.set(Calendar.HOUR_OF_DAY, alarm.hour);
+        candidate.set(Calendar.MINUTE, alarm.minute);
+        candidate.set(Calendar.SECOND, 0);
+        candidate.set(Calendar.MILLISECOND, 0);
+
+        if (alarm.type != AlarmType.ALARM || alarm.repeat.isEmpty()) {
+            if (candidate.getTimeInMillis() <= now.getTimeInMillis()) {
+                candidate.add(Calendar.DAY_OF_YEAR, 1);
+            }
+            return candidate;
+        }
+
+        Calendar best = null;
+        for (String repeatDay : alarm.repeat) {
+            Calendar repeated = (Calendar) candidate.clone();
+            int targetDay = calendarDayForRepeat(repeatDay);
+            int daysUntilTarget = (targetDay - now.get(Calendar.DAY_OF_WEEK) + 7) % 7;
+            repeated.add(Calendar.DAY_OF_YEAR, daysUntilTarget);
+            if (repeated.getTimeInMillis() <= now.getTimeInMillis()) {
+                repeated.add(Calendar.DAY_OF_YEAR, 7);
+            }
+            if (best == null || repeated.getTimeInMillis() < best.getTimeInMillis()) {
+                best = repeated;
+            }
+        }
+        return best == null ? candidate : best;
+    }
+
+    private int calendarDayForRepeat(String repeatDay) {
+        switch (repeatDay) {
+            case "Mon":
+                return Calendar.MONDAY;
+            case "Tue":
+                return Calendar.TUESDAY;
+            case "Wed":
+                return Calendar.WEDNESDAY;
+            case "Thu":
+                return Calendar.THURSDAY;
+            case "Fri":
+                return Calendar.FRIDAY;
+            case "Sat":
+                return Calendar.SATURDAY;
+            case "Sun":
+                return Calendar.SUNDAY;
+            default:
+                return Calendar.getInstance().get(Calendar.DAY_OF_WEEK);
         }
     }
 

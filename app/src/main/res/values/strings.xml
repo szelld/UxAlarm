@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">UxAlarm</string>
+    <string name="camera_attribution">Water scan camera</string>
 </resources>

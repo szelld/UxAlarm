@@ -4,13 +4,19 @@
 >
 
     <uses-permission android:name="android.permission.CAMERA" />
-    <uses-feature android:name="android.hardware.camera.any" />
+    <uses-feature
+            android:name="android.hardware.camera.any"
+            android:required="false" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
+
+    <attribution
+            android:tag="camera"
+            android:label="@string/camera_attribution" />
 
     <application
             android:allowBackup="true"
@@ -22,8 +28,9 @@
             android:supportsRtl="true"
             android:theme="@style/Theme.UxAlarm">
         <activity
-                android:name=".MainActivity"
+                android:name="com.example.uxalarm.MainActivity"
                 android:exported="true"
+                android:attributionTags="camera"
                 android:showWhenLocked="true"
                 android:turnScreenOn="true">
             <intent-filter>
