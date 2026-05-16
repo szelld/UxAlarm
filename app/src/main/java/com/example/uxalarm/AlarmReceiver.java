@@ -7,18 +7,8 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.media.AudioManager;
-import android.media.Ringtone;
-import android.media.RingtoneManager;
-import android.media.ToneGenerator;
-import android.net.Uri;
 import android.os.Build;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.PowerManager;
-import android.os.VibrationEffect;
-import android.os.Vibrator;
-import android.os.VibratorManager;
 
 import androidx.core.app.NotificationCompat;
 
@@ -35,10 +25,6 @@ public class AlarmReceiver extends BroadcastReceiver {
     public static final String EXTRA_ALARM_SOUND = "alarm_sound";
     private static final String PREFS_NAME = "uxalarm_prefs";
     private static final String PREFS_KEY_ALARMS = "alarms_json";
-    private static final Handler toneHandler = new Handler(Looper.getMainLooper());
-    private static Ringtone activeRingtone;
-    private static ToneGenerator activeToneGenerator;
-    private static Runnable activeToneLoop;
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -54,6 +40,7 @@ public class AlarmReceiver extends BroadcastReceiver {
         }
 
         createNotificationChannel(context);
+        AlarmRingingService.createNotificationChannel(context);
 
         // Wake the screen
         PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
@@ -63,20 +50,16 @@ public class AlarmReceiver extends BroadcastReceiver {
         );
         wakeLock.acquire(30000);
 
-        // Vibrate
-        vibrate(context);
-
-        // Play alarm sound
-        playSound(context, sound);
-
-        // Launch the app with the alarm info
         Intent launchIntent = new Intent(context, MainActivity.class);
         launchIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         launchIntent.putExtra(EXTRA_ALARM_ID, alarmId);
         launchIntent.putExtra(EXTRA_ALARM_TYPE, alarmType);
-        context.startActivity(launchIntent);
+        try {
+            context.startActivity(launchIntent);
+        } catch (Exception ignored) {
+            // Full-screen notification below is the supported fallback on newer Android versions.
+        }
 
-        // Also show a notification as fallback
         PendingIntent pendingIntent = PendingIntent.getActivity(
                 context, alarmId.hashCode(), launchIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
@@ -104,10 +87,18 @@ public class AlarmReceiver extends BroadcastReceiver {
                 .setAutoCancel(true)
                 .setContentIntent(pendingIntent)
                 .setFullScreenIntent(pendingIntent, true);
+        if ("BEDTIME".equals(alarmType)) {
+            builder.setSilent(true)
+                    .setOnlyAlertOnce(true)
+                    .setDefaults(0);
+        }
 
         NotificationManager notificationManager =
                 (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
         notificationManager.notify(alarmId.hashCode(), builder.build());
+        if (!"BEDTIME".equals(alarmType)) {
+            AlarmRingingService.start(context, alarmId, alarmType, sound);
+        }
 
         wakeLock.release();
     }
@@ -187,37 +178,8 @@ public class AlarmReceiver extends BroadcastReceiver {
         context.startActivity(launchIntent);
     }
 
-    private void vibrate(Context context) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            VibratorManager vm = (VibratorManager) context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
-            Vibrator vibrator = vm.getDefaultVibrator();
-            vibrator.vibrate(VibrationEffect.createWaveform(new long[]{0, 500, 200, 500, 200, 500}, -1));
-        } else {
-            Vibrator vibrator = (Vibrator) context.getSystemService(Context.VIBRATOR_SERVICE);
-            if (vibrator != null) {
-                vibrator.vibrate(VibrationEffect.createWaveform(new long[]{0, 500, 200, 500, 200, 500}, -1));
-            }
-        }
-    }
-
     public static void stopActiveAlert(Context context, String alarmId) {
-        if (activeRingtone != null && activeRingtone.isPlaying()) {
-            activeRingtone.stop();
-        }
-        activeRingtone = null;
-        stopFallbackTone();
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            VibratorManager vm = (VibratorManager) context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
-            if (vm != null) {
-                vm.getDefaultVibrator().cancel();
-            }
-        } else {
-            Vibrator vibrator = (Vibrator) context.getSystemService(Context.VIBRATOR_SERVICE);
-            if (vibrator != null) {
-                vibrator.cancel();
-            }
-        }
+        AlarmRingingService.stop(context, alarmId);
 
         if (alarmId != null) {
             NotificationManager notificationManager =
@@ -225,70 +187,6 @@ public class AlarmReceiver extends BroadcastReceiver {
             if (notificationManager != null) {
                 notificationManager.cancel(alarmId.hashCode());
             }
-        }
-    }
-
-    private void playSound(Context context, String sound) {
-        try {
-            Uri alarmUri = resolveSoundUri(context, sound);
-            if (activeRingtone != null && activeRingtone.isPlaying()) {
-                activeRingtone.stop();
-            }
-            activeRingtone = alarmUri == null ? null : RingtoneManager.getRingtone(context, alarmUri);
-            if (activeRingtone != null) {
-                activeRingtone.play();
-                return;
-            }
-        } catch (Exception e) {
-            // Fall through to generated tone.
-        }
-        startFallbackTone();
-    }
-
-    private Uri resolveSoundUri(Context context, String sound) {
-        int type;
-        if ("System Notification".equals(sound) || "Chime".equals(sound)) {
-            type = RingtoneManager.TYPE_NOTIFICATION;
-        } else if ("System Ringtone".equals(sound) || "Bell".equals(sound)) {
-            type = RingtoneManager.TYPE_RINGTONE;
-        } else if ("Beep".equals(sound)) {
-            return null;
-        } else {
-            type = RingtoneManager.TYPE_ALARM;
-        }
-
-        Uri actual = RingtoneManager.getActualDefaultRingtoneUri(context, type);
-        if (actual != null) {
-            return actual;
-        }
-        return RingtoneManager.getDefaultUri(type);
-    }
-
-    private void startFallbackTone() {
-        stopFallbackTone();
-        activeToneGenerator = new ToneGenerator(AudioManager.STREAM_ALARM, 100);
-        activeToneLoop = new Runnable() {
-            @Override
-            public void run() {
-                if (activeToneGenerator == null) {
-                    return;
-                }
-                activeToneGenerator.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 900);
-                toneHandler.postDelayed(this, 1200);
-            }
-        };
-        activeToneLoop.run();
-    }
-
-    private static void stopFallbackTone() {
-        if (activeToneLoop != null) {
-            toneHandler.removeCallbacks(activeToneLoop);
-            activeToneLoop = null;
-        }
-        if (activeToneGenerator != null) {
-            activeToneGenerator.stopTone();
-            activeToneGenerator.release();
-            activeToneGenerator = null;
         }
     }
 

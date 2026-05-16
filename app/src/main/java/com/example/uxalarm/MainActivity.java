@@ -24,6 +24,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.WindowManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
@@ -160,6 +161,16 @@ public class MainActivity extends AppCompatActivity {
         Window window = getWindow();
         window.setStatusBarColor(WHITE);
         window.setNavigationBarColor(WHITE);
+        window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                        | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                        | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                        | WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+        );
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true);
+            setTurnScreenOn(true);
+        }
 
         loadAlarms();
 
@@ -215,7 +226,12 @@ public class MainActivity extends AppCompatActivity {
             for (Alarm alarm : alarms) {
                 if (alarm.id.equals(alarmId)) {
                     handleTriggeredAlarmState(alarm);
-                    showSuccess(alarm);
+                    if (alarm.type == AlarmType.ALARM) {
+                        triggeredAlarm = alarm.copy();
+                        showScanScreen();
+                    } else {
+                        showSuccess(alarm);
+                    }
                     return;
                 }
             }
@@ -624,6 +640,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void saveEditingAlarm() {
+        editingAlarm.enabled = true;
         boolean replaced = false;
         for (int i = 0; i < alarms.size(); i++) {
             if (alarms.get(i).id.equals(editingAlarm.id)) {
